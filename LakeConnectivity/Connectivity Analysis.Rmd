@@ -1,0 +1,291 @@
+---
+title: "Lake Connectivity Analysis"
+subtitle: "Stream Cleaning"
+author: "Chris Madsen"
+date: "'r Sys.Date()'"
+output:  
+prettydoc::html_pretty:
+    theme: material
+    highlight: github
+    df_print: kable
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(sf)
+library(ggthemes)
+library(ggspatial)
+library(patchwork)
+library(rmapshaper)
+library(tictoc)
+rm(list = ls())
+
+output_folder = "W:/CMadsen/WaterbodyConnectivity"
+
+data_folder = "C:/Users/CMADSEN/Documents/WaterbodyGraphFun"
+```
+
+Read in data.
+```{r load in data}
+bc = read_sf("W:/CMadsen/SpatialData/bc_simple.shp")
+lakes = read_sf("W:/CMadsen/SpatialData/LakePoly.shp")
+subw = read_sf("W:/CMadsen/SpatialData/WatershedGroups.shp")
+```
+
+load in streams (huge!)
+```{r}
+streams = read_sf("C:/Users/CMADSEN/Documents/WaterbodyGraphFun/AllStreams/StreamPoly.shp")
+```
+
+```{r}
+#Make table to store results for lake network assignments.
+if(file.exists("W:/CMadsen/WaterbodyConnectivity/lakes_network_table.csv")){
+  lake_table = read_csv("W:/CMadsen/WaterbodyConnectivity/lakes_network_table.csv")
+}else{
+lake_table = lakes %>% 
+  st_drop_geometry() %>% 
+  select(WATERBOD_1,WATERSHED_,GNIS_NAME_) %>% mutate(
+      network_id = NA, num_connections = NA)
+}
+```
+
+```{r}
+find_spatial_networks = function(polygon_of_interest,
+                                 connector,
+                                 regions,
+                                 id_field1 = "WATERBOD_1",
+                                 id_field2 = "WATERSHED_",
+                                 id_field3 = "GNIS_NAME_",
+                                 output_table,
+                                 starting_number = 1,
+                                 output_folder = "W:/CMadsen/WaterbodyConnectivity"){
+  
+  #Set up visual output for user.
+  p_grid = ggplot() + 
+    geom_sf(data = bc) +
+    ggthemes::theme_map()
+  
+  print(p_grid)
+
+  ####################################
+  ### Run analysis for each region!###
+  ####################################
+
+  for(i in starting_number:nrow(regions)){
+    
+    region = regions[i,] %>% select(WATERSHED_) %>% rename(subwatershed = WATERSHED_)
+    
+    #If the region is made up of a large number of separate polygons, remove any that are less than
+    #1,000,000 square meters.
+    if(st_geometry_type(region) == "MULTIPOLYGON"){
+    region = region %>% 
+      st_cast("POLYGON") %>% 
+      mutate(area = as.numeric(st_area(.))) %>% 
+      filter(area > 1000000) %>% 
+      st_cast("MULTIPOLYGON")
+    }
+      
+    poly_cropped = st_crop(polygon_of_interest, region)
+    connector_cropped = st_crop(connector, region)
+    print("Cropped spatial files.")
+    
+    poly_cropped = st_join(poly_cropped, region, st_intersects) %>% filter()
+    connector_cropped = st_join(connector_cropped, region, st_intersects) %>% filter()
+    print("Trimmed away any shapefiles outside of our bounding region.")
+    
+    #If the connector shapefile is made of multiline strings, buffer
+    #by 1 meter to get polygons.
+    if(st_geometry_type(connector_cropped[1,]) %in% c("LINESTRING","MULTILINESTRING")){
+      print("Need to buffer the connector shapefile...")
+      
+      tic()
+      connector_cropped = st_buffer(connector_cropped, 1)
+      #print("Buffering of connector shapefile complete.")
+      toc()
+      }
+    
+    #Update visuals.
+    print(p_grid + geom_sf(data = region, col = "blue", fill = "lightblue", alpha = 0.5))
+    
+    
+    #Buffer polygon of interest by a little bit (3 meters) to ensure spatial overlap.
+    tic()
+    print("Buffering polygon of interest to ensure some overlap with connectors.")
+    poly_cropped = st_buffer(poly_cropped, dist = 3)
+    toc()
+    
+    print("Building networks.")
+    
+    #Prepare shapefiles for network analysis.
+    poly_cropped = poly_cropped %>% 
+      select(sym(id_field1),
+             sym(id_field2),
+             sym(id_field3)) %>% 
+      mutate(num_components = 1)
+    
+    connector_cropped = connector_cropped %>% 
+      select(geometry)
+    
+    #Get number of streams / rivers connecting to lakes.
+    number_connections_table = as.data.frame(st_intersects(poly_cropped, connector_cropped)) %>% 
+      as_tibble() %>% 
+      group_by(row.id) %>% 
+      summarise(number_connections = n())
+    
+    poly_cropped$num_connections = 0
+    
+    poly_cropped[number_connections_table$row.id,]$num_connections = number_connections_table$number_connections
+    print("Found number of connections for each polygon of interest.")
+    
+    tic()
+    print("Union and cast polygons to networks...")
+    networks = st_cast(st_union(poly_cropped %>% 
+                                  bind_rows(connector_cropped)), "POLYGON") %>% 
+      st_as_sf()
+    toc()
+    
+    #Find out which polygons from the cropped polygon of interest layer are 
+    #in each network.
+    tic()
+    networks = networks %>% mutate(network_number = row_number(),
+                        region = i)
+    
+    poly_cropped = st_join(networks, poly_cropped, st_intersects)
+    
+    #Just keep the largest network ID if a polygon of interest is in 2 networks...
+    poly_cropped = poly_cropped %>% 
+      st_drop_geometry() %>% 
+      group_by(WATERBOD_1,
+               WATERSHED_,
+               GNIS_NAME_) %>% 
+      #group_by(WATERBOD_1,WATERSHED_,GNIS_NAME_) %>% 
+      arrange(num_components) %>% 
+      slice(1)
+
+    print(paste0("Network IDs assigned to polygons of interest in region ",i))
+    toc()
+    
+    #Save the results of each loop to a table.
+    
+    output_table$regions_completed = i
+    
+    poly_cropped = poly_cropped %>% 
+      select(-num_components) %>% 
+                  rename(num_connections_to_add = num_connections)
+    
+    output_table = output_table %>% 
+      left_join(poly_cropped) %>% 
+      mutate(network_id = coalesce(network_id,network_number)) %>% 
+      mutate(num_connections = coalesce(num_connections,num_connections_to_add)) %>% 
+      select(-network_number,-region,-num_connections_to_add)
+    
+    write.csv(output_table, 
+              paste0(output_folder,"/",substitute(lakes),"_network_table.csv"),
+              row.names = F)
+    print(paste0("Lake network table updated. Number of non-NA lakes is now: ", nrow(output_table %>% filter(!is.na(network_id)))))
+    
+    print(paste0("Networks found for region ",i))
+  }
+}
+```
+
+```{r}
+find_spatial_networks(polygon_of_interest = lakes,
+                      connector = streams,
+                      regions = subw,
+                      id_field1 = "WATERBOD_1",
+                      id_field2 = "WATERSHED_",
+                      id_field3 = "GNIS_NAME_",
+                      output_table = lake_table,
+                      output_folder = output_folder,
+                      starting_number = 214
+)
+#Start time: 11:44 AM
+```
+
+```{r}
+#Lake table has networks assigned from some number onwards (not 1!) for each subwatershed separately. 
+#We need to change the network_id to be unique above the subwatershed level.
+# network_adjustment_table = lake_table %>% 
+#   select(WATERSHED_, network_id) %>% 
+#   distinct() %>% 
+#   group_by(WATERSHED_) %>% 
+#   summarise(number_networks = n()) %>% 
+#   mutate(total_networks_in_lower_subwatersheds = cumsum(number_networks)) %>% 
+#   select(-number_networks)
+
+lake_table = lake_table %>% 
+  select(-regions_completed) %>% 
+  arrange(WATERSHED_, network_id) %>% 
+  #Sort by ascending network number within each subwatershed.
+  group_by(WATERSHED_,network_id) %>% 
+  mutate(network_id_corrected = cur_group_id())
+
+lakes_n = lakes %>% 
+  left_join(lake_table)
+
+ggplot() + 
+  geom_sf(data = lakes_n, 
+          aes(fill = network_id))
+```
+
+```{r}
+#To stitch together any networks that SHOULD be a single network but were
+#split apart by subwatershed boundaries, we will:
+# 1. 
+
+lake_table = read_csv("W:/CMadsen/WaterbodyConnectivity/lakes_network_table.csv")
+
+lake_n1 = lakes %>% 
+  inner_join(lake_table %>% filter(network_id == 1))
+
+ggplot() + geom_sf(data = lake_n1)
+network_chunk_stitcher = function(x,
+                                  area = "W:/CMadsen/SpatialData/bc_simple.shp",
+                                  dist_to_boundary = 5000){
+
+  
+  if(file.exists(paste0(data_folder,"/area_squares.shp"))){
+    area_squares = read_sf(paste0(data_folder,"/area_squares.shp"))
+    print("Read in area of interest squares.")
+  }else{
+  warning("No 'area_squares' layer found in data folder")
+  warning("Please run 'split_polygons_in_area' function first")
+  break
+  }
+  
+  #Make shapefile that represents boundaries between chunks.
+  #Thickness of boundaries determined in function call.
+  area_boundaries = ms_erase(area_squares, st_buffer(area_squares, dist = -dist_to_boundary))
+  
+  dat = st_join(dat, area_boundaries, st_intersects)
+  
+  dat_to_stitch = dat %>% filter(!is.na(some_field_name_from_gpkg))
+  
+  dat_dont_stitch = dat %>% filter(is.na(some_field_name_from_gpkg))
+  
+  rm(dat)
+  
+  #Do another dissolve and st_cast on "dat_to_stitch" to join networks that should actually be joined. Do a test one to make sure we have overlaps.
+  networks_to_stitch = unique(dat_to_stitch$Some_ID_column)
+  for(network in networks_to_stitch){
+    
+  }
+  
+  #Take the lower of the 2+ network ids and apply them to all of the 
+  #components of any networks that have been found to be part of 
+  #the same overall network.
+  
+  #Correct the lake table so that they have updated network ids.
+  
+  #Write out shapefile of networks
+}
+```
+
+```{r}
+network_chunk_stitcher(x = "lake_network_results.gpkg")
+```
+
