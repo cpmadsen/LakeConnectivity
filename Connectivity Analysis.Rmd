@@ -22,9 +22,13 @@ library(rmapshaper)
 library(tictoc)
 rm(list = ls())
 
-output_folder = "W:/CMadsen/WaterbodyConnectivity"
+if(!dir.exists(paste0(getwd(), "/Output"))){
+  dir.create(paste0(getwd(), "/Output"))
+}
 
-data_folder = "C:/Users/CMADSEN/Documents/WaterbodyGraphFun"
+output_folder = paste0(getwd(), "/Output")
+
+# data_folder = "C:/Users/CMADSEN/Documents/WaterbodyGraphFun"
 ```
 
 Read in data.
