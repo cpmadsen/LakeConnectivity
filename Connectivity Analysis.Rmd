@@ -1,6 +1,5 @@
 ---
 title: "Lake Connectivity Analysis"
-subtitle: "Stream Cleaning"
 author: "Chris Madsen"
 date: "'r Sys.Date()'"
 output:  
